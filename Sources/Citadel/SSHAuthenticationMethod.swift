@@ -61,14 +61,26 @@ public final class SSHAuthenticationMethod: NIOSSHClientUserAuthenticationDelega
     /// cannot authenticate against a stock modern server. This offers
     /// `rsa-sha2-512` then `rsa-sha2-256`, and finally plain `ssh-rsa` when
     /// `includeSHA1Fallback` is set, for servers predating RFC 8332.
+    ///
+    /// The fallback is **off by default in this fork**, where upstream defaults
+    /// it on. An offer here is not a cheap advertisement: NIOSSH signs each
+    /// offer at the moment it makes it, in
+    /// `SSHMessage.UserAuthRequestMessage.init(request:sessionID:)` -
+    /// `let signature = try privateKeyRequest.privateKey.sign(dataToSign)` -
+    /// and there is no two-phase probe in which a key may be named without
+    /// being used. So appending the legacy offer puts a genuine SHA-1 RSA
+    /// signature over the session-bound payload on the wire as soon as the two
+    /// SHA-2 offers are rejected. A caller that needs a pre-RFC-8332 server has
+    /// to say so.
     /// - Parameters:
     ///   - username: The username to authenticate with.
     ///   - privateKey: The RSA private key to authenticate with.
-    ///   - includeSHA1Fallback: Also offer legacy `ssh-rsa`. Defaults to `true`.
+    ///   - includeSHA1Fallback: Also offer legacy `ssh-rsa`, which means signing
+    ///     with SHA-1. Defaults to `false`.
     public static func rsaSHA2(
         username: String,
         privateKey: Insecure.RSA.PrivateKey,
-        includeSHA1Fallback: Bool = true
+        includeSHA1Fallback: Bool = false
     ) -> SSHAuthenticationMethod {
         var offers: [NIOSSHUserAuthenticationOffer.Offer] = [
             .privateKey(.init(privateKey: .init(custom: Insecure.RSA.SHA2PrivateKey<RSASHA2_512>(privateKey)))),

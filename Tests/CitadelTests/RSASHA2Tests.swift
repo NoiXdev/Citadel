@@ -106,4 +106,95 @@ final class RSASHA2Tests: XCTestCase {
 
         XCTAssertEqual(legacyBuffer, sha2Buffer)
     }
+
+    // MARK: - Offer list
+
+    /// Drives the delegate until it runs out of offers, and returns the
+    /// algorithm name each offered public key puts on the wire.
+    ///
+    /// The offer list is private to `SSHAuthenticationMethod`, so the only way
+    /// to observe it is the way NIOSSH does: ask for the next offer until the
+    /// delegate refuses. The name is read back out of the serialized key blob,
+    /// which begins with an SSH string holding the algorithm name.
+    private func offeredPublicKeyPrefixes(
+        _ method: SSHAuthenticationMethod,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> [String] {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        let loop = group.next()
+
+        var prefixes: [String] = []
+        // The list is finite and short; the cap only stops a runaway loop from
+        // hanging the suite if the delegate ever stops draining itself.
+        for _ in 0 ..< 16 {
+            let promise = loop.makePromise(of: NIOSSHUserAuthenticationOffer?.self)
+            method.nextAuthenticationType(
+                availableMethods: .publicKey,
+                nextChallengePromise: promise
+            )
+
+            let offer: NIOSSHUserAuthenticationOffer?
+            do {
+                offer = try promise.futureResult.wait()
+            } catch {
+                // The delegate is out of offers.
+                return prefixes
+            }
+            guard case .privateKey(let privateKey) = offer?.offer else {
+                XCTFail("expected a private key offer, got \(String(describing: offer?.offer))", file: file, line: line)
+                return prefixes
+            }
+
+            var buffer = ByteBuffer()
+            privateKey.publicKey.write(to: &buffer)
+            guard
+                let length = buffer.readInteger(as: UInt32.self),
+                let prefix = buffer.readString(length: Int(length))
+            else {
+                XCTFail("offered public key does not begin with an SSH string", file: file, line: line)
+                return prefixes
+            }
+            prefixes.append(prefix)
+        }
+
+        XCTFail("delegate never ran out of offers", file: file, line: line)
+        return prefixes
+    }
+
+    /// The default offer list is SHA-2 only.
+    ///
+    /// NIOSSH signs an offer as it makes it - `UserAuthenticationMethod.swift`,
+    /// `let signature = try privateKeyRequest.privateKey.sign(dataToSign)` -
+    /// with no two-phase probe, so an `ssh-rsa` offer is a real SHA-1 signature
+    /// on the wire rather than an advertisement that costs nothing.
+    ///
+    /// The equality is the positive half of this check: it fails loudly if the
+    /// SHA-2 offers ever stop being made, which is what would otherwise let the
+    /// `ssh-rsa` half below pass by matching nothing at all.
+    func testDefaultOfferListIsSHA2Only() throws {
+        let prefixes = try offeredPublicKeyPrefixes(
+            .rsaSHA2(username: "test", privateKey: makeKey())
+        )
+
+        XCTAssertEqual(prefixes, [
+            Insecure.RSA.SHA2PrivateKey<RSASHA2_512>.keyPrefix,
+            Insecure.RSA.SHA2PrivateKey<RSASHA2_256>.keyPrefix,
+        ])
+        XCTAssertFalse(prefixes.contains(Insecure.RSA.PrivateKey.keyPrefix))
+    }
+
+    /// The legacy offer still exists - it just has to be asked for.
+    func testSHA1FallbackIsOfferedWhenAskedFor() throws {
+        let prefixes = try offeredPublicKeyPrefixes(
+            .rsaSHA2(username: "test", privateKey: makeKey(), includeSHA1Fallback: true)
+        )
+
+        XCTAssertEqual(prefixes, [
+            Insecure.RSA.SHA2PrivateKey<RSASHA2_512>.keyPrefix,
+            Insecure.RSA.SHA2PrivateKey<RSASHA2_256>.keyPrefix,
+            Insecure.RSA.PrivateKey.keyPrefix,
+        ])
+    }
 }
