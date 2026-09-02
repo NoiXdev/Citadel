@@ -15,7 +15,9 @@ import Crypto
 
 /// Hash variant for an RFC 8332 RSA signature.
 public protocol RSASHA2Variant: Sendable {
-    /// Wire name, used both as the public key algorithm and the signature type.
+    /// Wire name, used both as the public key ALGORITHM name (`pkalg`) and as
+    /// the signature type. Not the key blob's type string — RFC 8332 §3 keeps
+    /// that at `ssh-rsa`; see `SHA2PublicKey`.
     static var algorithmName: String { get }
     /// BoringSSL NID for the digest.
     static var nid: Int32 { get }
@@ -67,8 +69,53 @@ extension Insecure.RSA {
     }
 
     /// The same RSA public key (`e`, `n` on the wire) under an RFC 8332 name.
+    ///
+    /// RFC 8332 §3 splits a `publickey` user-auth request for an RSA key into
+    /// three identifiers, and only two of them are the algorithm:
+    ///
+    /// * `pkalg`, the public key algorithm name — `rsa-sha2-256` /
+    ///   `rsa-sha2-512`. NIOSSH writes it from
+    ///   `NIOSSHPublicKey.userAuthAlgorithmName`, which forwards to
+    ///   `userAuthAlgorithmName` below, in `writeUserAuthRequestMessage` and
+    ///   again into the signed payload (`UserAuthSignablePayload`).
+    /// * the key BLOB, whose inner type string stays `ssh-rsa`: the key
+    ///   material is the same `e`, `n` pair, and only the signature algorithm
+    ///   around it changes. NIOSSH writes it from
+    ///   `NIOSSHPublicKey.keyPrefix`, which forwards to `publicKeyPrefix`
+    ///   below, inside `writeSSHHostKey`.
+    /// * the SIGNATURE, typed with the algorithm name again — written from
+    ///   `SHA2Signature.signaturePrefix`, which is `Variant.algorithmName`.
+    ///   OpenSSH's `sshkey_check_sigtype` requires this to equal `pkalg`
+    ///   exactly.
+    ///
+    /// Both members are needed. `publicKeyPrefix` alone would send
+    /// `pkalg = ssh-rsa` around an `rsa-sha2-*` signature, which OpenSSH ≥ 8.8
+    /// refuses twice over — `ssh-rsa` is not in the default
+    /// `PubkeyAcceptedAlgorithms`, and the signature type would not match
+    /// `pkalg`. `userAuthAlgorithmName` alone would leave the blob typed
+    /// `rsa-sha2-*`, which Go's `x/crypto/ssh` refuses.
+    ///
+    /// ### Registration by prefix
+    ///
+    /// With `publicKeyPrefix == "ssh-rsa"` here, both variants and the SHA-1
+    /// `Insecure.RSA.PublicKey` claim the same blob prefix. Three consequences,
+    /// all on the READ side:
+    ///
+    /// * `NIOSSHPublicKey`'s blob lookup walks the registration list and takes
+    ///   the FIRST registered type whose `publicKeyPrefix` matches, so which
+    ///   type parses an incoming `ssh-rsa` blob is decided by registration
+    ///   order.
+    /// * The WRITE path is unaffected: serialisation reads the concrete
+    ///   instance's own prefix and the concrete signature's own
+    ///   `signaturePrefix`, never the registry.
+    /// * `NIOSSHPublicKey.BackingKey` equality (and hashing) compares
+    ///   `publicKeyPrefix` plus `rawRepresentation`, so the two variant
+    ///   wrappers around one RSA key — and the SHA-1 key — are now `==`. That
+    ///   is arguably right: it is the same key, and the variant is a choice of
+    ///   signature algorithm, not of key material.
     public final class SHA2PublicKey<Variant: RSASHA2Variant>: NIOSSHPublicKeyProtocol {
-        public static var publicKeyPrefix: String { Variant.algorithmName }
+        public static var publicKeyPrefix: String { "ssh-rsa" }
+        public static var userAuthAlgorithmName: String { Variant.algorithmName }
 
         internal let base: PublicKey
 
@@ -78,8 +125,10 @@ extension Insecure.RSA {
 
         public var rawRepresentation: Data { base.rawRepresentation }
 
-        /// Wire body is identical to `ssh-rsa`: mpint e, mpint n. Only the
-        /// algorithm name written around it differs.
+        /// Wire body is identical to `ssh-rsa`: mpint e, mpint n. With the blob
+        /// prefix now `ssh-rsa` too, the serialised key is byte-for-byte the
+        /// SHA-1 type's — the variant lives only in `userAuthAlgorithmName` and
+        /// in the signature.
         public func write(to buffer: inout ByteBuffer) -> Int {
             base.write(to: &buffer)
         }

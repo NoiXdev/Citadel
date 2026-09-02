@@ -3,7 +3,7 @@ import XCTest
 import Crypto
 import Citadel
 import NIO
-import NIOSSH
+@testable import NIOSSH
 
 /// RFC 8332 (`rsa-sha2-256` / `rsa-sha2-512`) signatures for RSA keys.
 final class RSASHA2Tests: XCTestCase {
@@ -53,13 +53,21 @@ final class RSASHA2Tests: XCTestCase {
         return try Insecure.RSA.PrivateKey(sshRsa: key)
     }
 
+    /// RFC 8332 §3 splits the three identifiers: the algorithm name (`pkalg`
+    /// and the signature type) is `rsa-sha2-N`, while the key blob stays typed
+    /// `ssh-rsa` because the key material is unchanged.
     func testAlgorithmNames() {
         XCTAssertEqual(Insecure.RSA.SHA2PrivateKey<RSASHA2_256>.keyPrefix, "rsa-sha2-256")
-        XCTAssertEqual(Insecure.RSA.SHA2PublicKey<RSASHA2_256>.publicKeyPrefix, "rsa-sha2-256")
+        XCTAssertEqual(Insecure.RSA.SHA2PublicKey<RSASHA2_256>.userAuthAlgorithmName, "rsa-sha2-256")
         XCTAssertEqual(Insecure.RSA.SHA2Signature<RSASHA2_256>.signaturePrefix, "rsa-sha2-256")
         XCTAssertEqual(Insecure.RSA.SHA2PrivateKey<RSASHA2_512>.keyPrefix, "rsa-sha2-512")
-        XCTAssertEqual(Insecure.RSA.SHA2PublicKey<RSASHA2_512>.publicKeyPrefix, "rsa-sha2-512")
+        XCTAssertEqual(Insecure.RSA.SHA2PublicKey<RSASHA2_512>.userAuthAlgorithmName, "rsa-sha2-512")
         XCTAssertEqual(Insecure.RSA.SHA2Signature<RSASHA2_512>.signaturePrefix, "rsa-sha2-512")
+
+        XCTAssertEqual(Insecure.RSA.SHA2PublicKey<RSASHA2_256>.publicKeyPrefix, "ssh-rsa")
+        XCTAssertEqual(Insecure.RSA.SHA2PublicKey<RSASHA2_512>.publicKeyPrefix, "ssh-rsa")
+        XCTAssertEqual(Insecure.RSA.PublicKey.publicKeyPrefix, "ssh-rsa")
+        XCTAssertEqual(Insecure.RSA.PublicKey.userAuthAlgorithmName, "ssh-rsa")
     }
 
     func testSHA256SignatureRoundTrips() throws {
@@ -109,23 +117,36 @@ final class RSASHA2Tests: XCTestCase {
 
     // MARK: - Offer list
 
-    /// Drives the delegate until it runs out of offers, and returns the
-    /// algorithm name each offered public key puts on the wire.
+    /// What one offered public key puts on the wire: the algorithm name NIOSSH
+    /// writes as `pkalg`, and the type string the key blob itself carries.
+    private struct OfferedKey: Equatable {
+        var algorithmName: String
+        var blobType: String
+    }
+
+    /// Drives the delegate until it runs out of offers, and returns both
+    /// identifiers for each offered public key.
     ///
     /// The offer list is private to `SSHAuthenticationMethod`, so the only way
     /// to observe it is the way NIOSSH does: ask for the next offer until the
-    /// delegate refuses. The name is read back out of the serialized key blob,
-    /// which begins with an SSH string holding the algorithm name.
-    private func offeredPublicKeyPrefixes(
+    /// delegate refuses.
+    ///
+    /// The two identifiers are read from the two members NIOSSH itself reads:
+    /// `NIOSSHPublicKey.userAuthAlgorithmName`, which `writeUserAuthRequestMessage`
+    /// writes as `pkalg`, and the leading SSH string of `write(to:)`, which is
+    /// the blob's own type. Since RFC 8332 typing landed, the blob string is
+    /// `ssh-rsa` for every RSA offer and no longer distinguishes the variants -
+    /// so the variant has to be read from the algorithm name.
+    private func offeredPublicKeys(
         _ method: SSHAuthenticationMethod,
         file: StaticString = #filePath,
         line: UInt = #line
-    ) throws -> [String] {
+    ) throws -> [OfferedKey] {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         defer { try? group.syncShutdownGracefully() }
         let loop = group.next()
 
-        var prefixes: [String] = []
+        var offered: [OfferedKey] = []
         // The list is finite and short; the cap only stops a runaway loop from
         // hanging the suite if the delegate ever stops draining itself.
         for _ in 0 ..< 16 {
@@ -140,27 +161,33 @@ final class RSASHA2Tests: XCTestCase {
                 offer = try promise.futureResult.wait()
             } catch {
                 // The delegate is out of offers.
-                return prefixes
+                return offered
             }
             guard case .privateKey(let privateKey) = offer?.offer else {
                 XCTFail("expected a private key offer, got \(String(describing: offer?.offer))", file: file, line: line)
-                return prefixes
+                return offered
             }
 
+            let publicKey = privateKey.publicKey
             var buffer = ByteBuffer()
-            privateKey.publicKey.write(to: &buffer)
+            publicKey.write(to: &buffer)
             guard
                 let length = buffer.readInteger(as: UInt32.self),
-                let prefix = buffer.readString(length: Int(length))
+                let blobType = buffer.readString(length: Int(length))
             else {
                 XCTFail("offered public key does not begin with an SSH string", file: file, line: line)
-                return prefixes
+                return offered
             }
-            prefixes.append(prefix)
+            offered.append(
+                OfferedKey(
+                    algorithmName: String(publicKey.userAuthAlgorithmName),
+                    blobType: blobType
+                )
+            )
         }
 
         XCTFail("delegate never ran out of offers", file: file, line: line)
-        return prefixes
+        return offered
     }
 
     /// The default offer list is SHA-2 only.
@@ -173,28 +200,54 @@ final class RSASHA2Tests: XCTestCase {
     /// The equality is the positive half of this check: it fails loudly if the
     /// SHA-2 offers ever stop being made, which is what would otherwise let the
     /// `ssh-rsa` half below pass by matching nothing at all.
+    ///
+    /// The negative reads the ALGORITHM name, not the blob type. Since RFC 8332
+    /// typing, every RSA blob here says `ssh-rsa`, so a negative against the
+    /// blob type could never match and would pass whatever was offered. The
+    /// SHA-1 type's algorithm name is `ssh-rsa` — `Insecure.RSA.PublicKey`
+    /// declares no separate `userAuthAlgorithmName`, so the protocol default
+    /// hands back its blob prefix — and that is the string a SHA-1 offer would
+    /// put in `pkalg`.
     func testDefaultOfferListIsSHA2Only() throws {
-        let prefixes = try offeredPublicKeyPrefixes(
+        let offered = try offeredPublicKeys(
             .rsaSHA2(username: "test", privateKey: makeKey())
         )
 
-        XCTAssertEqual(prefixes, [
-            Insecure.RSA.SHA2PrivateKey<RSASHA2_512>.keyPrefix,
-            Insecure.RSA.SHA2PrivateKey<RSASHA2_256>.keyPrefix,
+        XCTAssertEqual(offered.map(\.algorithmName), [
+            Insecure.RSA.SHA2PublicKey<RSASHA2_512>.userAuthAlgorithmName,
+            Insecure.RSA.SHA2PublicKey<RSASHA2_256>.userAuthAlgorithmName,
         ])
-        XCTAssertFalse(prefixes.contains(Insecure.RSA.PrivateKey.keyPrefix))
+        XCTAssertFalse(
+            offered.map(\.algorithmName).contains(Insecure.RSA.PublicKey.userAuthAlgorithmName)
+        )
+    }
+
+    /// Every offered RSA blob is typed `ssh-rsa`, whichever algorithm carries
+    /// it. This is the offer-list half of `RSAUserAuthBlobTypingTests`, and the
+    /// reason the two tests above can no longer tell the variants apart by the
+    /// blob string.
+    func testEveryOfferedRSABlobIsTypedSSHRSA() throws {
+        let offered = try offeredPublicKeys(
+            .rsaSHA2(username: "test", privateKey: makeKey(), includeSHA1Fallback: true)
+        )
+
+        XCTAssertEqual(offered.count, 3)
+        XCTAssertEqual(
+            Set(offered.map(\.blobType)),
+            [Insecure.RSA.PublicKey.publicKeyPrefix]
+        )
     }
 
     /// The legacy offer still exists - it just has to be asked for.
     func testSHA1FallbackIsOfferedWhenAskedFor() throws {
-        let prefixes = try offeredPublicKeyPrefixes(
+        let offered = try offeredPublicKeys(
             .rsaSHA2(username: "test", privateKey: makeKey(), includeSHA1Fallback: true)
         )
 
-        XCTAssertEqual(prefixes, [
-            Insecure.RSA.SHA2PrivateKey<RSASHA2_512>.keyPrefix,
-            Insecure.RSA.SHA2PrivateKey<RSASHA2_256>.keyPrefix,
-            Insecure.RSA.PrivateKey.keyPrefix,
+        XCTAssertEqual(offered.map(\.algorithmName), [
+            Insecure.RSA.SHA2PublicKey<RSASHA2_512>.userAuthAlgorithmName,
+            Insecure.RSA.SHA2PublicKey<RSASHA2_256>.userAuthAlgorithmName,
+            Insecure.RSA.PublicKey.userAuthAlgorithmName,
         ])
     }
 }
