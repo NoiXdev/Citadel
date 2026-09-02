@@ -30,6 +30,33 @@ public struct InvalidOpenSSHKey: Error {
     static let invalidPublicKeyPrefix = InvalidOpenSSHKey(reason: "invalidPublicKeyPrefix")
     static let invalidOrUnsupportedBCryptConfig = InvalidOpenSSHKey(reason: "invalidOrUnsupportedBCryptConfig")
     static let unexpectedKDFNoneOptions = InvalidOpenSSHKey(reason: "unexpectedKDFNoneOptions")
+    static let invalidCurveName = InvalidOpenSSHKey(reason: "invalidCurveName")
+    static let invalidECDSAPoint = InvalidOpenSSHKey(reason: "invalidECDSAPoint")
+    static let invalidECDSAScalar = InvalidOpenSSHKey(reason: "invalidECDSAScalar")
+}
+
+/// Thrown when an OpenSSH private key container holds a key of a different type
+/// than the initialiser that was asked to read it — most usefully, one ECDSA
+/// curve's initialiser applied to another curve's file.
+///
+/// This is separate from `InvalidOpenSSHKey`, and carries both type names,
+/// because it is the one parse failure a caller can act on: it says which
+/// initialiser the file wanted.
+public struct OpenSSHKeyTypeMismatch: Error, Equatable, CustomStringConvertible {
+    /// The key type the initialiser reads, e.g. `ecdsa-sha2-nistp256`.
+    public let expected: String
+
+    /// The key type the container holds.
+    public let found: String
+
+    public init(expected: String, found: String) {
+        self.expected = expected
+        self.found = found
+    }
+
+    public var description: String {
+        "OpenSSH key type mismatch: expected \(expected), found \(found)"
+    }
 }
 
 public typealias InvalidKey = InvalidOpenSSHKey
@@ -119,5 +146,149 @@ extension Insecure.RSA.PrivateKey: OpenSSHPrivateKey {
         CCryptoBoringSSL_BN_copy(privateExponent, privateKey.privateExponent)
         
         self.init(privateExponent: privateExponent, publicExponent: publicExponent, modulus: modulus)
+    }
+}
+
+extension P256.Signing.PublicKey: ByteBufferConvertible {
+    static func read(consuming buffer: inout ByteBuffer) throws -> P256.Signing.PublicKey {
+        try self.init(x963Representation: OpenSSH.ECDSACurve.nistp256.readPoint(consuming: &buffer))
+    }
+
+    @discardableResult
+    func write(to buffer: inout ByteBuffer) -> Int {
+        OpenSSH.ECDSACurve.nistp256.writePoint(x963Representation, to: &buffer)
+    }
+}
+
+extension P384.Signing.PublicKey: ByteBufferConvertible {
+    static func read(consuming buffer: inout ByteBuffer) throws -> P384.Signing.PublicKey {
+        try self.init(x963Representation: OpenSSH.ECDSACurve.nistp384.readPoint(consuming: &buffer))
+    }
+
+    @discardableResult
+    func write(to buffer: inout ByteBuffer) -> Int {
+        OpenSSH.ECDSACurve.nistp384.writePoint(x963Representation, to: &buffer)
+    }
+}
+
+extension P521.Signing.PublicKey: ByteBufferConvertible {
+    static func read(consuming buffer: inout ByteBuffer) throws -> P521.Signing.PublicKey {
+        try self.init(x963Representation: OpenSSH.ECDSACurve.nistp521.readPoint(consuming: &buffer))
+    }
+
+    @discardableResult
+    func write(to buffer: inout ByteBuffer) -> Int {
+        OpenSSH.ECDSACurve.nistp521.writePoint(x963Representation, to: &buffer)
+    }
+}
+
+extension P256.Signing.PrivateKey: OpenSSHPrivateKey {
+    typealias PublicKey = P256.Signing.PublicKey
+
+    static var publicKeyPrefix: String { OpenSSH.KeyType.ecdsaP256.rawValue }
+    static var privateKeyPrefix: String { OpenSSH.KeyType.ecdsaP256.rawValue }
+    static var keyType: OpenSSH.KeyType { .ecdsaP256 }
+
+    static func keyTypeMismatch(found: String) -> any Error {
+        OpenSSHKeyTypeMismatch(expected: publicKeyPrefix, found: found)
+    }
+
+    /// Creates a new P-256 private key from an OpenSSH private key file.
+    /// - Parameters:
+    ///  - data: The contents of the OpenSSH private key file, as UTF-8.
+    ///  - decryptionKey: The passphrase to decrypt the private key with, if it
+    ///    is passphrase-protected.
+    public init(sshEcdsa data: Data, decryptionKey: Data? = nil) throws {
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw InvalidOpenSSHKey.invalidUTF8String
+        }
+
+        try self.init(sshEcdsa: string, decryptionKey: decryptionKey)
+    }
+
+    /// Creates a new P-256 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - key: The OpenSSH private key string.
+    ///  - decryptionKey: The passphrase to decrypt the private key with, if it
+    ///    is passphrase-protected.
+    public init(sshEcdsa key: String, decryptionKey: Data? = nil) throws {
+        self = try OpenSSH.PrivateKey<P256.Signing.PrivateKey>(
+            string: key,
+            decryptionKey: decryptionKey
+        ).privateKey
+    }
+}
+
+extension P384.Signing.PrivateKey: OpenSSHPrivateKey {
+    typealias PublicKey = P384.Signing.PublicKey
+
+    static var publicKeyPrefix: String { OpenSSH.KeyType.ecdsaP384.rawValue }
+    static var privateKeyPrefix: String { OpenSSH.KeyType.ecdsaP384.rawValue }
+    static var keyType: OpenSSH.KeyType { .ecdsaP384 }
+
+    static func keyTypeMismatch(found: String) -> any Error {
+        OpenSSHKeyTypeMismatch(expected: publicKeyPrefix, found: found)
+    }
+
+    /// Creates a new P-384 private key from an OpenSSH private key file.
+    /// - Parameters:
+    ///  - data: The contents of the OpenSSH private key file, as UTF-8.
+    ///  - decryptionKey: The passphrase to decrypt the private key with, if it
+    ///    is passphrase-protected.
+    public init(sshEcdsa data: Data, decryptionKey: Data? = nil) throws {
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw InvalidOpenSSHKey.invalidUTF8String
+        }
+
+        try self.init(sshEcdsa: string, decryptionKey: decryptionKey)
+    }
+
+    /// Creates a new P-384 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - key: The OpenSSH private key string.
+    ///  - decryptionKey: The passphrase to decrypt the private key with, if it
+    ///    is passphrase-protected.
+    public init(sshEcdsa key: String, decryptionKey: Data? = nil) throws {
+        self = try OpenSSH.PrivateKey<P384.Signing.PrivateKey>(
+            string: key,
+            decryptionKey: decryptionKey
+        ).privateKey
+    }
+}
+
+extension P521.Signing.PrivateKey: OpenSSHPrivateKey {
+    typealias PublicKey = P521.Signing.PublicKey
+
+    static var publicKeyPrefix: String { OpenSSH.KeyType.ecdsaP521.rawValue }
+    static var privateKeyPrefix: String { OpenSSH.KeyType.ecdsaP521.rawValue }
+    static var keyType: OpenSSH.KeyType { .ecdsaP521 }
+
+    static func keyTypeMismatch(found: String) -> any Error {
+        OpenSSHKeyTypeMismatch(expected: publicKeyPrefix, found: found)
+    }
+
+    /// Creates a new P-521 private key from an OpenSSH private key file.
+    /// - Parameters:
+    ///  - data: The contents of the OpenSSH private key file, as UTF-8.
+    ///  - decryptionKey: The passphrase to decrypt the private key with, if it
+    ///    is passphrase-protected.
+    public init(sshEcdsa data: Data, decryptionKey: Data? = nil) throws {
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw InvalidOpenSSHKey.invalidUTF8String
+        }
+
+        try self.init(sshEcdsa: string, decryptionKey: decryptionKey)
+    }
+
+    /// Creates a new P-521 private key from an OpenSSH private key string.
+    /// - Parameters:
+    ///  - key: The OpenSSH private key string.
+    ///  - decryptionKey: The passphrase to decrypt the private key with, if it
+    ///    is passphrase-protected.
+    public init(sshEcdsa key: String, decryptionKey: Data? = nil) throws {
+        self = try OpenSSH.PrivateKey<P521.Signing.PrivateKey>(
+            string: key,
+            decryptionKey: decryptionKey
+        ).privateKey
     }
 }

@@ -18,6 +18,7 @@ protocol OpenSSHPrivateKey: ByteBufferConvertible {
     static var privateKeyPrefix: String { get }
     static var publicKeyPrefix: String { get }
     static var keyType: OpenSSH.KeyType { get }
+    static func keyTypeMismatch(found: String) -> any Error
     
     associatedtype PublicKey: ByteBufferConvertible
 }
@@ -287,6 +288,9 @@ enum OpenSSH {
     enum KeyType: String {
         case sshRSA = "ssh-rsa"
         case sshED25519 = "ssh-ed25519"
+        case ecdsaP256 = "ecdsa-sha2-nistp256"
+        case ecdsaP384 = "ecdsa-sha2-nistp384"
+        case ecdsaP521 = "ecdsa-sha2-nistp521"
     }
     
     struct PrivateKey<SSHKey: OpenSSHPrivateKey> {
@@ -350,7 +354,7 @@ extension OpenSSH.PrivateKey {
         
         let publicKeyType = try OpenSSH.KeyType(consuming: &publicKeyBuffer)
         guard publicKeyType.rawValue == SSHKey.publicKeyPrefix else {
-            throw InvalidOpenSSHKey.invalidPublicKeyPrefix
+            throw SSHKey.keyTypeMismatch(found: publicKeyType.rawValue)
         }
 
         self.publicKey = try SSHKey.PublicKey.read(consuming: &publicKeyBuffer)
@@ -462,5 +466,199 @@ extension OpenSSH.KeyType {
             throw InvalidOpenSSHKey.unsupportedFeature(.unsupportedPublicKeyType)
         }
         self = keyType
+    }
+}
+
+extension OpenSSHPrivateKey {
+    /// The error a container of the wrong key type produces.
+    ///
+    /// The ECDSA keys override this to name both types, because there one
+    /// initialiser per curve means picking the wrong one is an ordinary caller
+    /// mistake that the caller can only correct if it is told which curve the
+    /// file actually holds.
+    static func keyTypeMismatch(found: String) -> any Error {
+        InvalidOpenSSHKey.invalidPublicKeyPrefix
+    }
+}
+
+extension OpenSSH {
+    /// One of the three NIST curves OpenSSH writes as `ecdsa-sha2-nistp*`.
+    ///
+    /// Both halves of such a key repeat the curve inside their own section,
+    /// after the key type that precedes them: the public half is
+    /// `string curve, string Q`, the private half is
+    /// `string curve, string Q, mpint d`. `Q` is the uncompressed X9.63 point
+    /// `0x04 || X || Y`.
+    enum ECDSACurve: String {
+        case nistp256, nistp384, nistp521
+
+        /// The width in bytes of one coordinate of `Q`, which is also the width
+        /// `init(rawRepresentation:)` wants for the private scalar `d`.
+        /// P-521's 521 bits round up to 66 bytes.
+        var coordinateSize: Int {
+            switch self {
+            case .nistp256: return 32
+            case .nistp384: return 48
+            case .nistp521: return 66
+            }
+        }
+
+        var keyType: KeyType {
+            switch self {
+            case .nistp256: return .ecdsaP256
+            case .nistp384: return .ecdsaP384
+            case .nistp521: return .ecdsaP521
+            }
+        }
+
+        /// Reads `string curve, string Q`, returning the X9.63 point.
+        func readPoint(consuming buffer: inout ByteBuffer) throws -> Data {
+            guard let name = buffer.readSSHString() else {
+                throw InvalidOpenSSHKey.invalidLayout
+            }
+
+            guard name == rawValue else {
+                throw InvalidOpenSSHKey.invalidCurveName
+            }
+
+            guard
+                var point = buffer.readSSHBuffer(),
+                let bytes = point.readBytes(length: point.readableBytes)
+            else {
+                throw InvalidOpenSSHKey.invalidLayout
+            }
+
+            guard bytes.count == 1 + 2 * coordinateSize, bytes[0] == 0x04 else {
+                throw InvalidOpenSSHKey.invalidECDSAPoint
+            }
+
+            return Data(bytes)
+        }
+
+        /// Reads `string curve, string Q, mpint d`, returning the point and the
+        /// scalar widened to `coordinateSize`.
+        func readKeyPair(consuming buffer: inout ByteBuffer) throws -> (point: Data, scalar: Data) {
+            let point = try readPoint(consuming: &buffer)
+
+            guard
+                var scalarBuffer = buffer.readSSHBuffer(),
+                let mpint = scalarBuffer.readBytes(length: scalarBuffer.readableBytes)
+            else {
+                throw InvalidOpenSSHKey.invalidLayout
+            }
+
+            // `d` is an SSH mpint: a signed big-endian integer carrying no
+            // redundant leading bytes. So it is one byte longer than the curve
+            // whenever the scalar's top bit is set (the 0x00 sign byte), and
+            // shorter than the curve whenever the scalar's own leading bytes are
+            // zero. Neither is a `rawRepresentation`, which is fixed-width.
+            let significant = Array(mpint.drop { $0 == 0x00 })
+
+            guard significant.count <= coordinateSize else {
+                throw InvalidOpenSSHKey.invalidECDSAScalar
+            }
+
+            let scalar = [UInt8](repeating: 0x00, count: coordinateSize - significant.count) + significant
+            return (point, Data(scalar))
+        }
+
+        /// Reads a private half and checks it against itself: the public key the
+        /// parsed scalar produces has to be the point the container carries.
+        func readPrivateKey<Key>(
+            consuming buffer: inout ByteBuffer,
+            make: (Data) throws -> Key,
+            publicPoint: (Key) -> Data
+        ) throws -> Key {
+            let parts = try readKeyPair(consuming: &buffer)
+            let key = try make(parts.scalar)
+
+            guard publicPoint(key) == parts.point else {
+                throw InvalidOpenSSHKey.invalidPublicKeyInPrivateKey
+            }
+
+            return key
+        }
+
+        /// Writes `string curve, string Q`.
+        @discardableResult
+        func writePoint(_ point: Data, to buffer: inout ByteBuffer) -> Int {
+            buffer.writeSSHString(Array(rawValue.utf8)) + buffer.writeSSHString(Array(point))
+        }
+
+        /// Writes `string curve, string Q, mpint d`.
+        @discardableResult
+        func writeKeyPair(point: Data, scalar: Data, to buffer: inout ByteBuffer) -> Int {
+            writePoint(point, to: &buffer) + buffer.writeSSHString(Self.mpint(scalar))
+        }
+
+        /// Narrows a fixed-width scalar back to an SSH mpint: leading zero bytes
+        /// dropped, and a 0x00 sign byte put back when the top bit would
+        /// otherwise read as negative.
+        private static func mpint(_ scalar: Data) -> [UInt8] {
+            var bytes = Array(scalar.drop { $0 == 0x00 })
+
+            if let first = bytes.first, first & 0x80 != 0 {
+                bytes.insert(0x00, at: 0)
+            }
+
+            return bytes
+        }
+    }
+}
+
+extension P256.Signing.PrivateKey: ByteBufferConvertible {
+    static func read(consuming buffer: inout ByteBuffer) throws -> Self {
+        try OpenSSH.ECDSACurve.nistp256.readPrivateKey(
+            consuming: &buffer,
+            make: { try Self(rawRepresentation: $0) },
+            publicPoint: { $0.publicKey.x963Representation }
+        )
+    }
+
+    @discardableResult
+    func write(to buffer: inout ByteBuffer) -> Int {
+        OpenSSH.ECDSACurve.nistp256.writeKeyPair(
+            point: publicKey.x963Representation,
+            scalar: rawRepresentation,
+            to: &buffer
+        )
+    }
+}
+
+extension P384.Signing.PrivateKey: ByteBufferConvertible {
+    static func read(consuming buffer: inout ByteBuffer) throws -> Self {
+        try OpenSSH.ECDSACurve.nistp384.readPrivateKey(
+            consuming: &buffer,
+            make: { try Self(rawRepresentation: $0) },
+            publicPoint: { $0.publicKey.x963Representation }
+        )
+    }
+
+    @discardableResult
+    func write(to buffer: inout ByteBuffer) -> Int {
+        OpenSSH.ECDSACurve.nistp384.writeKeyPair(
+            point: publicKey.x963Representation,
+            scalar: rawRepresentation,
+            to: &buffer
+        )
+    }
+}
+
+extension P521.Signing.PrivateKey: ByteBufferConvertible {
+    static func read(consuming buffer: inout ByteBuffer) throws -> Self {
+        try OpenSSH.ECDSACurve.nistp521.readPrivateKey(
+            consuming: &buffer,
+            make: { try Self(rawRepresentation: $0) },
+            publicPoint: { $0.publicKey.x963Representation }
+        )
+    }
+
+    @discardableResult
+    func write(to buffer: inout ByteBuffer) -> Int {
+        OpenSSH.ECDSACurve.nistp521.writeKeyPair(
+            point: publicKey.x963Representation,
+            scalar: rawRepresentation,
+            to: &buffer
+        )
     }
 }
