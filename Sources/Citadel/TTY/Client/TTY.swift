@@ -90,8 +90,26 @@ public struct TTYStdinWriter {
     /// keeps reading, and the caller never reaches the exit status.
     ///
     /// This is NIO's half-closure on the SSH child channel, which sends
-    /// `SSH_MSG_CHANNEL_EOF`. The channel remains readable afterwards; call
-    /// it at most once per channel.
+    /// `SSH_MSG_CHANNEL_EOF`. The channel remains readable afterwards.
+    ///
+    /// **Nothing may be written to standard input after this.** A later
+    /// `write` does not merely fail on its own: `sendChannelData` rejects it
+    /// in `.halfClosedLocal` with
+    /// `NIOSSHError.protocolViolation(protocolName: "channel", violation:
+    /// "Sent message after EOF.")`, and `SSHChildChannel` routes that throw
+    /// through `errorEncountered`, which fails the pending writes, fires
+    /// `errorCaught` down the pipeline and notifies the channel inactive. So
+    /// the inbound stream finishes throwing the protocol violation, and the
+    /// caller loses the remaining output AND the exit status — not just the
+    /// write it attempted. A trailing block written after the half-close
+    /// therefore costs the whole result.
+    ///
+    /// **Calling this more than once is a caller contract, not a checked
+    /// one.** Neither side enforces it: a SECOND call does not throw, because
+    /// `sendChannelEOF`'s `.halfClosedLocal` branch moves the state silently
+    /// on to `.quiescent`. A THIRD call does throw, from `.quiescent`, as
+    /// `"Sent EOF out of sequence."` — so a repeated call is neither safe nor
+    /// reliably diagnosed. Call it exactly once.
     ///
     /// ## Example
     /// ```swift

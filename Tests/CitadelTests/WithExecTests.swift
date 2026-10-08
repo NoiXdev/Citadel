@@ -502,6 +502,59 @@ final class WithExecTests: XCTestCase {
         }
     }
 
+    /// The SUCCESS half of the same masking: a command that succeeded must
+    /// not have its success replaced by the error from closing a channel the
+    /// far side already closed. `withExec` closes AFTER `perform` returns, and
+    /// by then the far side has normally closed the channel itself, so that
+    /// close finds it gone and fails with `ChannelError.alreadyClosed`.
+    ///
+    /// `testWithExecReportsExitStatusRatherThanTheCloseError` below cannot
+    /// cover this: it only ever reaches `withExec`'s `catch`, so the `try?`
+    /// there is enough to make it green while the success path stays broken.
+    func testWithExecSucceedsWhenTheFarSideClosedTheChannelFirst() async throws {
+        final class ExitsZero: ExecDelegate, @unchecked Sendable {
+            struct Ctx: ExecCommandContext {
+                func terminate() async throws {}
+            }
+            func setEnvironmentValue(_ value: String, forKey key: String) async throws {}
+            func start(command: String, outputHandler: ExecOutputHandler) async throws -> ExecCommandContext {
+                DispatchQueue.global().async {
+                    let out = outputHandler.stdoutPipe.fileHandleForWriting
+                    out.write(Data("done".utf8))
+                    try? out.close()
+                    try? outputHandler.stderrPipe.fileHandleForWriting.close()
+                    // Let NIO drain the pipe before succeed triggers pipeChannel.close
+                    Thread.sleep(forTimeInterval: 0.3)
+                    outputHandler.succeed(exitCode: 0)
+                }
+                return Ctx()
+            }
+        }
+
+        try await runTest { server, client in
+            server.enableExec(withDelegate: ExitsZero())
+
+            // No `do`/`catch` around this call on purpose: the property IS
+            // that `withExec` returns. Absorbing a throw here would turn the
+            // case into one that passes while the defect is present.
+            try await client.withExec("exits-zero") { inbound, outbound in
+                var collected = ByteBuffer()
+                for try await chunk in inbound {
+                    if case .stdout(let buf) = chunk {
+                        collected.writeImmutableBuffer(buf)
+                    }
+                }
+                XCTAssertEqual(String(buffer: collected), "done")
+                // Return only once the far side has actually closed, so the
+                // close `withExec` performs next cannot win a race against it.
+                // Without this the case would be green on timing rather than
+                // on the property — and it is the already-closed channel that
+                // the property is about.
+                try await outbound.channel.closeFuture.get()
+            }
+        }
+    }
+
     /// A missing command reports exit 127, and that status must reach the
     /// caller. `withExec`'s `catch` closes the channel before it rethrows, so
     /// a channel the far side has already closed must not let
