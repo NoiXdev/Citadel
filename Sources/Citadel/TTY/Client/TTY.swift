@@ -81,6 +81,30 @@ public struct TTYStdinWriter {
         try await channel.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(buffer)))
     }
 
+    /// Signal end-of-input on the TTY's standard input, leaving the inbound
+    /// half open for the remaining output and the exit status.
+    ///
+    /// A tool that reads standard input to end-of-input — `tar -x`, `unzip`,
+    /// `cat` — does not terminate until it sees EOF. Writing bytes is not
+    /// enough: without this the channel's outbound half stays open, the tool
+    /// keeps reading, and the caller never reaches the exit status.
+    ///
+    /// This is NIO's half-closure on the SSH child channel, which sends
+    /// `SSH_MSG_CHANNEL_EOF`. The channel remains readable afterwards; call
+    /// it at most once per channel.
+    ///
+    /// ## Example
+    /// ```swift
+    /// try await client.withExec("tar -xf -") { inbound, outbound in
+    ///     try await outbound.write(archiveBytes)
+    ///     try await outbound.closeStandardInput()
+    ///     for try await _ in inbound {}
+    /// }
+    /// ```
+    public func closeStandardInput() async throws {
+        try await channel.close(mode: .output)
+    }
+
     public func changeSize(cols: Int, rows: Int, pixelWidth:Int, pixelHeight:Int) async throws {
         try await channel.triggerUserOutboundEvent(
             SSHChannelRequestEvent.WindowChangeRequest(
@@ -463,8 +487,18 @@ extension SSHClient {
             mode: .command(command)
         )
 
+        // Closing is cleanup, not the command's outcome. The far side closes
+        // the channel itself once the command has exited, so this close can
+        // find it closed already — and a `ChannelError.alreadyClosed` thrown
+        // from here would take the place of the `CommandFailed` carrying the
+        // exit status, which is the one thing a caller can act on (exit 127,
+        // a POSIX shell's report of a missing command).
         func close() async throws {
-            try await channel.close()
+            do {
+                try await channel.close()
+            } catch ChannelError.alreadyClosed {
+                // The far side got there first; this close has nothing left to do.
+            }
         }
 
         do {
@@ -472,7 +506,9 @@ extension SSHClient {
             try await perform(inbound, TTYStdinWriter(channel: channel))
             try await close()
         } catch {
-            try await close()
+            // Whatever closing does, the error `perform` threw is the one the
+            // caller needs.
+            try? await close()
             throw error
         }
     }

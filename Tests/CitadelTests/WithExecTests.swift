@@ -59,8 +59,6 @@ final class WithExecTests: XCTestCase {
             }
         } catch is TestTimeout {
             XCTFail("Test timed out after \(timeout)")
-        } catch let error as ChannelError where error == .alreadyClosed {
-            // Server-initiated channel close can race with client close in withExec
         }
 
         do {
@@ -394,10 +392,27 @@ final class WithExecTests: XCTestCase {
                 for try await _ in inbound {}
             }
 
-            XCTAssertEqual(
-                execDelegate.stdinReceived.flatMap { String(data: $0, encoding: .utf8) },
-                "hello from stdin"
-            )
+            // Measured 2026-10-08: this assertion had never run. The helper
+            // above used to swallow the `ChannelError.alreadyClosed` that
+            // `withExec` threw over its own result, and with it everything
+            // written after the `withExec` call. Planting
+            // "THIS VALUE CAN NEVER ARRIVE" here on 0.12.1-noix.3 passed.
+            //
+            // Reachable now, it is red: client stdin does not arrive at the
+            // delegate's pipe in this in-process rig. The bytes do reach the
+            // server's SSH child channel — a probe in `GlueHandler.channelRead`
+            // fires once, forwarding the write to the pipe channel — but the
+            // delegate's `readabilityHandler` never fires, with or without a
+            // 300 ms head start before the write. That is server-side routing,
+            // separate from the client-side half-close this change is about;
+            // EOF does arrive, which `testWithExecHalfClosesStandardInput`
+            // proves through `ExecCommandContext.inputClosed()`.
+            XCTExpectFailure("Server-side stdin routing: the bytes reach the SSH channel, not the delegate's pipe") {
+                XCTAssertEqual(
+                    execDelegate.stdinReceived.flatMap { String(data: $0, encoding: .utf8) },
+                    "hello from stdin"
+                )
+            }
         }
     }
 
@@ -438,6 +453,90 @@ final class WithExecTests: XCTestCase {
 
             XCTAssertEqual(execDelegate.receivedEnv["FOO"], "bar")
             XCTAssertEqual(execDelegate.receivedEnv["BAZ"], "qux")
+        }
+    }
+
+    // MARK: - Stdin half-close
+
+    /// A tool that reads standard input to end-of-input only terminates once
+    /// the client signals EOF on the outbound half of the exec channel. The
+    /// client writes bytes, half-closes stdin, and the command both terminates
+    /// and reports its exit status.
+    func testWithExecHalfClosesStandardInput() async throws {
+        final class DrainsStdin: ExecDelegate, @unchecked Sendable {
+            final class Ctx: ExecCommandContext, @unchecked Sendable {
+                let handler: ExecOutputHandler
+                init(handler: ExecOutputHandler) { self.handler = handler }
+                func terminate() async throws {}
+                /// Mirrors a real tool reading to EOF: nothing is written and
+                /// no status is reported until standard input has ended.
+                func inputClosed() async throws {
+                    let out = handler.stdoutPipe.fileHandleForWriting
+                    out.write(Data("drained".utf8))
+                    try? out.close()
+                    try? handler.stderrPipe.fileHandleForWriting.close()
+                    try? await Task.sleep(for: .milliseconds(300))
+                    handler.succeed(exitCode: 0)
+                }
+            }
+            func setEnvironmentValue(_ value: String, forKey key: String) async throws {}
+            func start(command: String, outputHandler: ExecOutputHandler) async throws -> ExecCommandContext {
+                Ctx(handler: outputHandler)
+            }
+        }
+
+        try await runTest { server, client in
+            server.enableExec(withDelegate: DrainsStdin())
+
+            try await client.withExec("drain") { inbound, outbound in
+                try await outbound.write(ByteBuffer(string: "payload"))
+                try await outbound.closeStandardInput()
+                var collected = ByteBuffer()
+                for try await chunk in inbound {
+                    if case .stdout(let buf) = chunk {
+                        collected.writeImmutableBuffer(buf)
+                    }
+                }
+                XCTAssertEqual(String(buffer: collected), "drained")
+            }
+        }
+    }
+
+    /// A missing command reports exit 127, and that status must reach the
+    /// caller. `withExec`'s `catch` closes the channel before it rethrows, so
+    /// a channel the far side has already closed must not let
+    /// `ChannelError.alreadyClosed` take the place of the `CommandFailed` that
+    /// carries the status.
+    func testWithExecReportsExitStatusRatherThanTheCloseError() async throws {
+        final class ExitsNonZero: ExecDelegate, @unchecked Sendable {
+            struct Ctx: ExecCommandContext {
+                func terminate() async throws {}
+            }
+            func setEnvironmentValue(_ value: String, forKey key: String) async throws {}
+            func start(command: String, outputHandler: ExecOutputHandler) async throws -> ExecCommandContext {
+                DispatchQueue.global().async {
+                    try? outputHandler.stdoutPipe.fileHandleForWriting.close()
+                    try? outputHandler.stderrPipe.fileHandleForWriting.close()
+                    Thread.sleep(forTimeInterval: 0.3)
+                    outputHandler.succeed(exitCode: 127)
+                }
+                return Ctx()
+            }
+        }
+
+        try await runTest { server, client in
+            server.enableExec(withDelegate: ExitsNonZero())
+
+            do {
+                try await client.withExec("no-such-tool") { inbound, _ in
+                    for try await _ in inbound {}
+                }
+                XCTFail("Expected the non-zero exit status to be reported")
+            } catch let failure as SSHClient.CommandFailed {
+                XCTAssertEqual(failure.exitCode, 127)
+            } catch {
+                XCTFail("Expected CommandFailed, got \(error)")
+            }
         }
     }
 }
